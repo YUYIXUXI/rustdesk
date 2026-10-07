@@ -191,16 +191,40 @@ jobs:
       - name: Publish Release
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
         with:
-          prerelease: true
+          prerelease: false
           tag_name: ${{ github.ref_name }}
-          name: RustDesk ${{ env.VERSION }} (custom server ${{ github.ref_name }})
+          name: RustDesk ${{ github.ref_name }}
           body: |
-            自建服务器版本。
+            ## RustDesk ${{ github.ref_name }}
 
-            - ID 服务器: `36.150.231.220:21116`
-            - 中继服务器: `36.150.231.220:21117`
-            - 架构: Windows x64
-            - 签名: 未签名（fork 无签名密钥）
+            基于 rustdesk/rustdesk 官方源码构建，使用自建服务端。
+
+            ### 服务端配置
+
+            | 项目 | 地址 |
+            |---|---|
+            | ID 服务器 | `36.150.231.220:21116` |
+            | 中继服务器 | `36.150.231.220:21117` |
+
+            客户端已内置上述地址与对应的服务端公钥，无需在设置中手动填写。
+
+            ### 系统要求与安装
+
+            - 架构：Windows x64
+            - 需要 Windows 10 及以上
+            - 下载后**将全部文件解压到同一个目录**：`rustdesk.exe` 只是启动器，
+              核心逻辑在 `librustdesk.dll`，各插件 DLL 必须与 exe 同目录
+
+            ### 已知提示
+
+            - 本构建**未做代码签名**，Windows SmartScreen 可能显示未知发布者提示，
+              选择"更多信息 → 仍要运行"即可
+            - 硬件编解码已启用（`--hwcodec --vram`）
+
+            ### 说明
+
+            自建服务端需配套的 hbb 服务端（hbbs/hbbr）并使用相同密钥，
+            公钥已内置于客户端。
           files: |
             rustdesk/rustdesk.exe
             rustdesk/*.dll
