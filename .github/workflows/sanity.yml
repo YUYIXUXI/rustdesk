@@ -1,0 +1,17 @@
+name: Sanity Check
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - custom-server
+
+jobs:
+  ping:
+    name: Ping
+    runs-on: ubuntu-latest
+    steps:
+      - name: Say hello
+        run: |
+          echo "Actions are working."
+          echo "ID server: 36.150.231.220"
