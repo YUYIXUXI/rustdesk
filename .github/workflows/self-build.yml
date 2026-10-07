@@ -188,6 +188,54 @@ jobs:
           Remove-Item -Path "usbmmidd_v2\deviceinstaller64.exe","usbmmidd_v2\deviceinstaller.exe","usbmmidd_v2\usbmmidd.bat" -ErrorAction SilentlyContinue
           mv -Force .\usbmmidd_v2 ./rustdesk
 
+      - name: Find Runner.res
+        continue-on-error: true
+        shell: bash
+        run: |
+          runner_res=$(find . -name "Runner.res")
+          if [ "$runner_res" == "" ]; then
+            echo "Runner.res: not found"
+          else
+            echo "Runner.res: $runner_res"
+            cp $runner_res ./libs/portable/Runner.res
+          fi
+
+      - name: Build self-extracted single-file executable
+        shell: pwsh
+        run: |
+          # 官方流程里有这一步，之前漏了。用 libs/portable 的 packer 把整个
+          # rustdesk 目录用 brotli 压缩内嵌进单个 exe，运行时会自动释放到临时目录。
+          # 先去掉 manifest 里的 dpiAware 行（官方 workflow 同样处理）。
+          sed -i '/dpiAware/d' res/manifest.xml
+          cd libs/portable
+          pip3 install -r requirements.txt
+          python3 ./generate.py -f ../../rustdesk/ -o . -e ../../rustdesk/rustdesk.exe
+          cd ../..
+          New-Item -ItemType Directory -Force -Path ./SignOutput | Out-Null
+          mv ./libs/portable/target/release/rustdesk-portable-packer.exe ./SignOutput/rustdesk-${{ github.ref_name }}-x64.exe
+
+      - name: Verify single-file executable
+        shell: pwsh
+        run: |
+          $exe = Get-Item ./SignOutput/rustdesk-${{ github.ref_name }}-x64.exe
+          Write-Host ("Size: {0:N1} MB" -f ($exe.Length / 1MB))
+          if ($exe.Length -lt 40MB) {
+            Write-Error "Single-file exe is suspiciously small - packing may have failed"
+            exit 1
+          }
+          # 确认打包产物确实内嵌了自建服务器地址
+          $bytes = [System.IO.File]::ReadAllBytes($exe.FullName)
+          $text = [System.Text.Encoding]::ASCII.GetString($bytes)
+          if ($text -notmatch "36\.150\.231\.220") {
+            Write-Error "Custom ID server not found in packed exe"
+            exit 1
+          }
+          if ($text -match "rs-ny\.rustdesk\.com") {
+            Write-Error "Official server address still present in packed exe"
+            exit 1
+          }
+          Write-Host "Packed exe contains 36.150.231.220 and no official address - OK"
+
       - name: Publish Release
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
         with:
@@ -208,23 +256,27 @@ jobs:
 
             客户端已内置上述地址与对应的服务端公钥，无需在设置中手动填写。
 
-            ### 系统要求与安装
+            ### 安装
+
+            **下载 `rustdesk-${{ github.ref_name }}-x64.exe` 即可，单文件独立运行，无需安装。**
+
+            首次运行时会把内置文件释放到用户临时目录，之后直接运行该 exe 即可。
+            可以把它放在任意目录（如桌面、U 盘），也可右键发送到桌面快捷方式。
 
             - 架构：Windows x64
             - 需要 Windows 10 及以上
-            - 下载后**将全部文件解压到同一个目录**：`rustdesk.exe` 只是启动器，
-              核心逻辑在 `librustdesk.dll`，各插件 DLL 必须与 exe 同目录
 
             ### 已知提示
 
             - 本构建**未做代码签名**，Windows SmartScreen 可能显示未知发布者提示，
               选择"更多信息 → 仍要运行"即可
             - 硬件编解码已启用（`--hwcodec --vram`）
+            - 免安装绿色版：如需彻底卸载，删除 exe 即可（另需清理
+              `%TEMP%\rustdesk-portable` 下的释放目录）
 
             ### 说明
 
             自建服务端需配套的 hbb 服务端（hbbs/hbbr）并使用相同密钥，
             公钥已内置于客户端。
           files: |
-            rustdesk/rustdesk.exe
-            rustdesk/*.dll
+            ./SignOutput/rustdesk-${{ github.ref_name }}-x64.exe
