@@ -211,8 +211,21 @@ jobs:
           pip3 install -r requirements.txt
           python3 ./generate.py -f ../../rustdesk/ -o . -e ../../rustdesk/rustdesk.exe
           cd ../..
+          # libs/portable 是 workspace member，cargo 把产物放在仓库根的 target/ 下，
+          # 不是 libs/portable/target/。两处都找一遍，兼容不同 cargo 版本行为。
+          $packer = @(
+            "./target/release/rustdesk-portable-packer.exe",
+            "./libs/portable/target/release/rustdesk-portable-packer.exe",
+            "./target/x86_64-pc-windows-msvc/release/rustdesk-portable-packer.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $packer) {
+            Write-Error "rustdesk-portable-packer.exe not found. Searched:"
+            Get-ChildItem -Path . -Recurse -Filter "rustdesk-portable-packer.exe" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.FullName)" }
+            exit 1
+          }
+          Write-Host "Packer found: $packer"
           New-Item -ItemType Directory -Force -Path ./SignOutput | Out-Null
-          mv ./libs/portable/target/release/rustdesk-portable-packer.exe ./SignOutput/rustdesk-${{ github.ref_name }}-x64.exe
+          Copy-Item $packer ./SignOutput/rustdesk-${{ github.ref_name }}-x64.exe
 
       - name: Verify single-file executable
         shell: pwsh
@@ -223,17 +236,38 @@ jobs:
             Write-Error "Single-file exe is suspiciously small - packing may have failed"
             exit 1
           }
-          # 确认打包产物确实内嵌了自建服务器地址
-          $bytes = [System.IO.File]::ReadAllBytes($exe.FullName)
-          $text = [System.Text.Encoding]::ASCII.GetString($bytes)
-          if ($text -notmatch "36\.150\.231\.220") {
-            Write-Error "Custom ID server not found in packed exe"
-            exit 1
-          }
-          if ($text -match "rs-ny\.rustdesk\.com") {
-            Write-Error "Official server address still present in packed exe"
-            exit 1
-          }
+          # 确认打包产物确实内嵌了自建服务器地址。
+          # 逐块扫描，避免把整个 40+ MB 文件转成字符串（那会慢到超时）。
+          # 每块读1MB+64，但下一次从"已消费位置 - 64"重新开始，
+          # 保证跨块边界的短字符串也能被检出。
+          $need = [System.Text.Encoding]::ASCII.GetBytes("36.150.231.220")
+          $bad  = [System.Text.Encoding]::ASCII.GetBytes("rs-ny.rustdesk.com")
+          $needLen = $need.Length; $badLen = $bad.Length
+          $overlap = [Math]::Max($needLen, $badLen) - 1
+          $foundNew = $false; $foundOld = $false
+          $chunk = 1MB
+          $buf = New-Object byte[] ($chunk + $overlap)
+          $fs = [System.IO.File]::OpenRead($exe.FullName)
+          try {
+            $carry = 0   #上一块尾部保留的字节数
+            while ($true) {
+              $n = $fs.Read($buf, $carry, $chunk)
+              if ($n -le 0) { break }
+              $total = $carry + $n
+              $hay = $buf[0..($total-1)]
+              $csv = $hay -join ','
+              if (-not $foundNew) { $foundNew = $csv -match ($need -join ',') }
+              if (-not $foundOld) { $foundOld = $csv -match ($bad  -join ',') }
+              if ($foundNew -and $foundOld) { break }
+              # 把尾部 overlap 字节挪到开头
+              if ($total -ge $overlap) {
+                [Array]::Copy($buf, $total - $overlap, $buf, 0, $overlap)
+                $carry = $overlap
+              } else { $carry = $total }
+            }
+          } finally { $fs.Close() }
+          if (-not $foundNew) { Write-Error "Custom ID server 36.150.231.220 not found in packed exe"; exit 1 }
+          if ($foundOld)   { Write-Error "Official server address still present in packed exe"; exit 1 }
           Write-Host "Packed exe contains 36.150.231.220 and no official address - OK"
 
       - name: Publish Release
