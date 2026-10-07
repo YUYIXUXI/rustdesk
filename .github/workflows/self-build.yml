@@ -1,0 +1,206 @@
+# 自构建 Windows 版本（fork 自用）
+#
+# 为什么不复用官方的 flutter-tag.yml -> flutter-build.yml 链路：
+# 那条链依赖 `uses: ./.github/workflows/xxx.yml` 的嵌套 workflow 调用，
+# 在 fork 环境下 GitHub 会直接判定 startup_failure（本fork 实测）。
+# 本文件把所有步骤内联，避开嵌套调用。
+#
+# 差异：只构建 Windows x64（不含arm64 / macOS / Linux / Android / iOS / Web）。
+
+name: Build Windows Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+-[0-9]+'
+
+permissions:
+  contents: write
+
+env:
+  RUST_VERSION: "1.75"
+  FLUTTER_VERSION: "3.24.5"
+  LLVM_VERSION: "15.0.6"
+  # 与官方 vcpkg.json baseline 一致（2026.07.29）
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  VERSION: "1.5.0"
+
+jobs:
+  bridge:
+    name: Generate flutter-rust bridge
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get install -y \
+            clang cmake curl gcc g++ libclang-dev \
+            libgtk-3-dev llvm-dev nasm ninja-build pkg-config wget
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: "x86_64-unknown-linux-gnu"
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: bridge-ubuntu-22.04
+
+      - name: Install flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: "stable"
+          flutter-version: "3.22.3"
+          cache: true
+
+      - name: Install flutter rust bridge deps
+        shell: bash
+        run: |
+          cargo install cargo-expand --version 1.0.95 --locked
+          cargo install flutter_rust_bridge_codegen --version 1.80.1 --features "uuid" --locked
+          # Flutter 3.22.3 下 extended_text 14 需要更新的 Dart，降级以便解析
+          sed -i -e 's/extended_text: 14.0.0/extended_text: 13.0.0/g' flutter/pubspec.yaml
+          cd flutter && flutter pub get && cd ..
+
+      - name: Run flutter rust bridge
+        run: |
+          ~/.cargo/bin/flutter_rust_bridge_codegen \
+            --rust-input ./src/flutter_ffi.rs \
+            --dart-output ./flutter/lib/generated_bridge.dart \
+            --c-output ./flutter/macos/Runner/bridge_generated.h
+          cp ./flutter/macos/Runner/bridge_generated.h ./flutter/ios/Runner/bridge_generated.h
+
+      - name: Upload bridge artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bridge-artifact
+          path: |
+            ./src/bridge_generated.rs
+            ./src/bridge_generated.io.rs
+            ./flutter/lib/generated_bridge.dart
+            ./flutter/lib/generated_bridge.freezed.dart
+            ./flutter/macos/Runner/bridge_generated.h
+            ./flutter/ios/Runner/bridge_generated.h
+
+  build:
+    name: Build Windows x64
+    needs: [bridge]
+    runs-on: windows-2022
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+
+      - name: Verify custom server config
+        shell: bash
+        run: |
+          echo "--- hbb_common server config ---"
+          grep -nE "RENDEZVOUS_SERVERS|RS_PUB_KEY|RENDEZVOUS_PORT|RELAY_PORT" \
+            libs/hbb_common/src/config.rs | head -8
+          echo "--- .gitmodules ---"
+          cat .gitmodules
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0 # v2.0.9
+        with:
+          version: ${{ env.LLVM_VERSION }}
+
+      - name: Install flutter
+        uses: subosito/flutter-action@2783a3f08e1baf891508463f8c6653c258246225 # v2.12.0
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          architecture: x64
+
+      - name: Replace engine with rustdesk custom flutter engine
+        shell: pwsh
+        run: |
+          flutter doctor -v
+          flutter precache --windows
+          Invoke-WebRequest -Uri https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip -OutFile windows-x64-release.zip
+          Expand-Archive -Path windows-x64-release.zip -DestinationPath windows-x64-release
+          mv -Force windows-x64-release/*  C:/hostedtoolcache/windows/flutter/stable-${{ env.FLUTTER_VERSION }}-x64/bin/cache/artifacts/engine/windows-x64-release/
+
+      - name: Patch flutter
+        shell: bash
+        run: |
+          cp .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff $(dirname $(dirname $(which flutter)))
+          cd $(dirname $(dirname $(which flutter)))
+          git apply flutter_3.24.4_dropdown_menu_enableFilter.diff
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: "x86_64-pc-windows-msvc"
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: windows-2022
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        shell: bash
+        env:
+          VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
+        run: |
+          $VCPKG_ROOT/vcpkg install \
+            --triplet x64-windows-static \
+            --x-install-root="$VCPKG_ROOT/installed"
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Build rustdesk
+        shell: pwsh
+        run: |
+          python3 .\build.py --portable --flutter --skip-portable-pack --hwcodec --vram
+          mv ./flutter/build/windows/x64/runner/Release ./rustdesk
+
+      - name: Bundle usbmmidd and printer driver
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip -OutFile usbmmidd_v2.zip
+          Expand-Archive usbmmidd_v2.zip -DestinationPath .
+          Remove-Item -Path usbmmidd_v2\Win32 -Recurse -ErrorAction SilentlyContinue
+          Remove-Item -Path "usbmmidd_v2\deviceinstaller64.exe","usbmmidd_v2\deviceinstaller.exe","usbmmidd_v2\usbmmidd.bat" -ErrorAction SilentlyContinue
+          mv -Force .\usbmmidd_v2 ./rustdesk
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
+        with:
+          prerelease: true
+          tag_name: ${{ github.ref_name }}
+          name: RustDesk ${{ env.VERSION }} (custom server ${{ github.ref_name }})
+          body: |
+            自建服务器版本。
+
+            - ID 服务器: `36.150.231.220:21116`
+            - 中继服务器: `36.150.231.220:21117`
+            - 架构: Windows x64
+            - 签名: 未签名（fork 无签名密钥）
+          files: |
+            rustdesk/rustdesk.exe
+            rustdesk/*.dll
