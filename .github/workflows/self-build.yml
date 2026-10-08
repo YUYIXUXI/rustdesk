@@ -210,6 +210,7 @@ jobs:
           cd libs/portable
           pip3 install -r requirements.txt
           python3 ./generate.py -f ../../rustdesk/ -o . -e ../../rustdesk/rustdesk.exe
+          Write-Host ("data.bin: {0:N1} MB" -f ((Get-Item ./data.bin).Length / 1MB))
           cd ../..
           # libs/portable 是 workspace member，cargo 把产物放在仓库根的 target/ 下，
           # 不是 libs/portable/target/。两处都找一遍，兼容不同 cargo 版本行为。
@@ -227,48 +228,54 @@ jobs:
           New-Item -ItemType Directory -Force -Path ./SignOutput | Out-Null
           Copy-Item $packer ./SignOutput/rustdesk-${{ github.ref_name }}-x64.exe
 
+      - name: Upload single-file executable artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rustdesk-single-file-x64
+          path: ./SignOutput/rustdesk-${{ github.ref_name }}-x64.exe
+
       - name: Verify single-file executable
         shell: pwsh
         run: |
+          # 单文件 exe 内部是 brotli 压缩过的完整运行目录（解压后约 90 MB），
+          # 所以成品约 24 MB 是正常的，不能拿 "> 40 MB" 当验收标准。
+          # 更关键的是：载荷内容是压缩数据，服务器地址在 exe 里无论如何搜不到，
+          # 配置校验必须对打包前的 librustdesk.dll 做（明文只在那里）。
+          $dll = Get-Item ./rustdesk/librustdesk.dll
+          Write-Host ("librustdesk.dll: {0:N1} MB" -f ($dll.Length / 1MB))
+          $latin1 = [System.Text.Encoding]::GetEncoding(28591)
+          $dllText = $latin1.GetString([System.IO.File]::ReadAllBytes($dll.FullName))
+          $hasCustom = $dllText.Contains('36.150.231.220')
+          $hasOldHost = $dllText.Contains('rs-ny.rustdesk.com')
+          $hasOldKey = $dllText.Contains('OeVuKk5nlHiX')
+          Write-Host "custom ID server present : $hasCustom"
+          Write-Host "official host present    : $hasOldHost"
+          Write-Host "official pubkey present  : $hasOldKey"
+          if (-not $hasCustom) {
+            Write-Error "Custom ID server 36.150.231.220 not found in librustdesk.dll"
+            exit 1
+          }
+          if ($hasOldHost -or $hasOldKey) {
+            Write-Error "Official RustDesk server address or pubkey still present in librustdesk.dll"
+            exit 1
+          }
+
           $exe = Get-Item ./SignOutput/rustdesk-${{ github.ref_name }}-x64.exe
-          Write-Host ("Size: {0:N1} MB" -f ($exe.Length / 1MB))
-          if ($exe.Length -lt 40MB) {
+          Write-Host ("single-file exe: {0:N1} MB" -f ($exe.Length / 1MB))
+          if ($exe.Length -lt 10MB) {
             Write-Error "Single-file exe is suspiciously small - packing may have failed"
             exit 1
           }
-          # 确认打包产物确实内嵌了自建服务器地址。
-          # 逐块扫描，避免把整个 40+ MB 文件转成字符串（那会慢到超时）。
-          # 每块读1MB+64，但下一次从"已消费位置 - 64"重新开始，
-          # 保证跨块边界的短字符串也能被检出。
-          $need = [System.Text.Encoding]::ASCII.GetBytes("36.150.231.220")
-          $bad  = [System.Text.Encoding]::ASCII.GetBytes("rs-ny.rustdesk.com")
-          $needLen = $need.Length; $badLen = $bad.Length
-          $overlap = [Math]::Max($needLen, $badLen) - 1
-          $foundNew = $false; $foundOld = $false
-          $chunk = 1MB
-          $buf = New-Object byte[] ($chunk + $overlap)
-          $fs = [System.IO.File]::OpenRead($exe.FullName)
-          try {
-            $carry = 0   #上一块尾部保留的字节数
-            while ($true) {
-              $n = $fs.Read($buf, $carry, $chunk)
-              if ($n -le 0) { break }
-              $total = $carry + $n
-              $hay = $buf[0..($total-1)]
-              $csv = $hay -join ','
-              if (-not $foundNew) { $foundNew = $csv -match ($need -join ',') }
-              if (-not $foundOld) { $foundOld = $csv -match ($bad  -join ',') }
-              if ($foundNew -and $foundOld) { break }
-              # 把尾部 overlap 字节挪到开头
-              if ($total -ge $overlap) {
-                [Array]::Copy($buf, $total - $overlap, $buf, 0, $overlap)
-                $carry = $overlap
-              } else { $carry = $total }
+          # data.bin 只压缩文件内容，每个条目的路径是明文写入的，
+          # 因此能在 exe 里搜到这些文件名，就证明载荷确实被完整内嵌。
+          $exeText = $latin1.GetString([System.IO.File]::ReadAllBytes($exe.FullName))
+          foreach ($marker in @('librustdesk.dll', 'flutter_windows.dll', 'rustdesk.exe', 'usbmmIdd.dll')) {
+            if (-not $exeText.Contains($marker)) {
+              Write-Error "Packed exe is missing payload entry: $marker"
+              exit 1
             }
-          } finally { $fs.Close() }
-          if (-not $foundNew) { Write-Error "Custom ID server 36.150.231.220 not found in packed exe"; exit 1 }
-          if ($foundOld)   { Write-Error "Official server address still present in packed exe"; exit 1 }
-          Write-Host "Packed exe contains 36.150.231.220 and no official address - OK"
+          }
+          Write-Host "Packed exe embeds the full runtime payload and the custom server config - OK"
 
       - name: Publish Release
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
